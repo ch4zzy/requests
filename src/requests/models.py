@@ -502,7 +502,8 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         # Don't do any URL preparation for non-HTTP schemes like `mailto`,
         # `data` etc to work around exceptions from `url_parse`, which
         # handles RFC 3986 only.
-        if ":" in url and not url.lower().startswith("http"):
+        is_custom_non_http_scheme = ":" in url and not url.lower().startswith("http")
+        if is_custom_non_http_scheme:
             self.url = url
             return
 
