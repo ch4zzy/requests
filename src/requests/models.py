@@ -105,6 +105,81 @@ CONTENT_CHUNK_SIZE: int = 10 * 1024
 ITER_CHUNK_SIZE: int = 512
 
 
+class MultipartEncoder:
+    """Encapsulates the construction and MIME serialization of multipart/form-data requests."""
+
+    def __init__(self, files: _t.FilesType, data: _t.RawDataType | None = None) -> None:
+        if not files:
+            raise ValueError("Files must be provided.")
+        elif isinstance(data, basestring):
+            raise ValueError("Data must not be a string.")
+
+        self.files = files
+        self.data = data
+
+    @staticmethod
+    def process_data_fields(data: _t.RawDataType | None) -> list[tuple[str, bytes]]:
+        """Normalize and encode form data fields into UTF-8 tuples."""
+        result: list[tuple[str, bytes]] = []
+        fields: list[tuple[Any, Any]] = to_key_val_list(data or {})  # type: ignore[arg-type]
+        for field, val in fields:
+            vals: list[Any] = [val] if (isinstance(val, basestring) or not hasattr(val, "__iter__")) else list(val)
+            for v in vals:
+                if v is not None:
+                    # Don't call str() on bytestrings: in Py3 it all goes wrong.
+                    v_str = str(v) if not isinstance(v, bytes) else None
+                    v_bytes: bytes = v if isinstance(v, bytes) else v_str.encode("utf-8")  # type: ignore[union-attr]
+                    field_str: str = field.decode("utf-8") if isinstance(field, bytes) else str(field)
+                    result.append((field_str, v_bytes))
+        return result
+
+    @staticmethod
+    def process_file_field(k: str, v: Any) -> RequestField | None:
+        """Process a single file entry (2/3/4-tuple or stream) and return a configured RequestField."""
+        fn: str | None = None
+        fp: Any = None
+        ft: str | None = None
+        fh: Any = None
+        if isinstance(v, (tuple, list)):
+            v_tuple: tuple[Any, ...] = tuple(v)
+            if len(v_tuple) == 2:
+                fn, fp = v_tuple[0], v_tuple[1]
+            elif len(v_tuple) == 3:
+                fn, fp, ft = v_tuple[0], v_tuple[1], v_tuple[2]
+            else:
+                fn, fp, ft, fh = v_tuple[0], v_tuple[1], v_tuple[2], v_tuple[3]
+        else:
+            fn = guess_filename(v) or k
+            fp = v
+
+        fdata: Any
+        if isinstance(fp, (str, bytes, bytearray)):
+            fdata = fp
+        elif _t.has_read(fp):
+            fdata = fp.read()
+        elif fp is None:  # defensive check for untyped callers
+            return None
+        else:
+            fdata = fp
+
+        rf = RequestField(name=k, data=fdata, filename=fn, headers=fh)  # type: ignore[arg-type]
+        rf.make_multipart(content_type=ft)  # type: ignore[arg-type]
+        return rf
+
+    def encode(self) -> tuple[bytes, str]:
+        """Build and encode fields into multipart body and content-type header."""
+        new_fields: list[RequestField | tuple[str, bytes]] = []
+        new_fields.extend(self.process_data_fields(self.data))
+
+        for k, v in to_key_val_list(self.files or {}):
+            file_field = self.process_file_field(k, v)
+            if file_field is not None:
+                new_fields.append(file_field)
+
+        body, content_type = encode_multipart_formdata(new_fields)
+        return body, content_type
+
+
 class RequestEncodingMixin:
     url: str | None
 
@@ -183,72 +258,18 @@ class RequestEncodingMixin:
     def _encode_files(
         files: _t.FilesType, data: _t.RawDataType | None
     ) -> tuple[bytes, str]:
-        """Build the body for a multipart/form-data request.
+        """Build the body for a multipart/form-data request. Delegates to MultipartEncoder."""
+        return MultipartEncoder(files, data).encode()
 
-        Will successfully encode files when passed as a dict or a list of
-        tuples. Order is retained if data is a list of tuples but arbitrary
-        if parameters are supplied as a dict.
-        The tuples may be 2-tuples (filename, fileobj), 3-tuples (filename, fileobj, contentype)
-        or 4-tuples (filename, fileobj, contentype, custom_headers).
-        """
-        if not files:
-            raise ValueError("Files must be provided.")
-        elif isinstance(data, basestring):
-            raise ValueError("Data must not be a string.")
+    @staticmethod
+    def _process_data_fields(data: _t.RawDataType | None) -> list[tuple[str, bytes]]:
+        """Normalize and encode form data fields into UTF-8 tuples."""
+        return MultipartEncoder.process_data_fields(data)
 
-        new_fields: list[RequestField | tuple[str, bytes]] = []
-        fields = to_key_val_list(data or {})
-        files = to_key_val_list(files or {})
-
-        for field, val in fields:
-            if isinstance(val, basestring) or not hasattr(val, "__iter__"):
-                val = [val]
-            for v in val:
-                if v is not None:
-                    # Don't call str() on bytestrings: in Py3 it all goes wrong.
-                    if not isinstance(v, bytes):
-                        v = str(v)
-
-                    new_fields.append(
-                        (
-                            field.decode("utf-8")
-                            if isinstance(field, bytes)
-                            else field,
-                            v.encode("utf-8") if isinstance(v, str) else v,
-                        )
-                    )
-
-        for k, v in files:
-            # support for explicit filename
-            ft = None
-            fh = None
-            if isinstance(v, (tuple, list)):
-                if len(v) == 2:
-                    fn, fp = v
-                elif len(v) == 3:
-                    fn, fp, ft = v
-                else:
-                    fn, fp, ft, fh = v
-            else:
-                fn = guess_filename(v) or k
-                fp = v
-
-            if isinstance(fp, (str, bytes, bytearray)):
-                fdata = fp
-            elif _t.has_read(fp):
-                fdata = fp.read()
-            elif fp is None:  # defensive check for untyped callers
-                continue
-            else:
-                fdata = fp
-
-            rf = RequestField(name=k, data=fdata, filename=fn, headers=fh)
-            rf.make_multipart(content_type=ft)
-            new_fields.append(rf)
-
-        body, content_type = encode_multipart_formdata(new_fields)
-
-        return body, content_type
+    @staticmethod
+    def _process_file_field(k: str, v: Any) -> RequestField | None:
+        """Process a single file entry (2/3/4-tuple or stream) and return a configured RequestField."""
+        return MultipartEncoder.process_file_field(k, v)
 
 
 class RequestHooksMixin:
@@ -373,6 +394,123 @@ class Request(RequestHooksMixin):
             hooks=self.hooks,
         )
         return p
+
+
+class BodyPayloadStrategy:
+    """Base strategy for preparing request bodies."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        raise NotImplementedError
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[Any, str | None]:
+        raise NotImplementedError
+
+
+class JsonPayloadStrategy(BodyPayloadStrategy):
+    """Strategy for encoding JSON request bodies."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        return not data and json is not None
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[bytes, str]:
+        content_type = "application/json"
+        try:
+            body = complexjson.dumps(json, allow_nan=False)
+        except ValueError as ve:
+            raise InvalidJSONError(ve, request=request)
+
+        if not isinstance(body, bytes):
+            body = body.encode("utf-8")
+        return body, content_type
+
+
+class StreamPayloadStrategy(BodyPayloadStrategy):
+    """Strategy for streaming request bodies and generators."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        is_iterable = isinstance(data, Iterable) or hasattr(data, "__iter__")
+        return is_iterable and not isinstance(data, (str, bytes, list, tuple, Mapping))
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[Any, None]:
+        if files:
+            raise NotImplementedError("Streamed bodies and files are mutually exclusive.")
+
+        try:
+            length = super_len(data)
+        except (TypeError, AttributeError, UnsupportedOperation):
+            length = None
+
+        body = data
+        if getattr(body, "tell", None) is not None:
+            try:
+                request._body_position = body.tell()  # type: ignore[union-attr]
+            except OSError:
+                request._body_position = object()
+
+        if length:
+            request.headers["Content-Length"] = builtin_str(length)
+        else:
+            request.headers["Transfer-Encoding"] = "chunked"
+
+        return body, None
+
+
+class MultipartPayloadStrategy(BodyPayloadStrategy):
+    """Strategy for multipart/form-data file uploads."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        return bool(files)
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[Any, str]:
+        raw_data = cast("_t.RawDataType | None", data)
+        return request._encode_files(files, raw_data)
+
+
+class DefaultPayloadStrategy(BodyPayloadStrategy):
+    """Strategy for form-encoded and raw byte/string bodies."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        return True
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[Any, str | None]:
+        raw_data = cast("_t.RawDataType | None", data)
+        body = None
+        content_type = None
+        if raw_data:
+            body = request._encode_params(raw_data)
+            if isinstance(data, basestring) or _t.has_read(data):
+                content_type = None
+            else:
+                content_type = "application/x-www-form-urlencoded"
+        return body, content_type
+
+
+BODY_PAYLOAD_STRATEGIES: tuple[type[BodyPayloadStrategy], ...] = (
+    JsonPayloadStrategy,
+    StreamPayloadStrategy,
+    MultipartPayloadStrategy,
+    DefaultPayloadStrategy,
+)
 
 
 class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
@@ -502,7 +640,8 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         # Don't do any URL preparation for non-HTTP schemes like `mailto`,
         # `data` etc to work around exceptions from `url_parse`, which
         # handles RFC 3986 only.
-        if ":" in url and not url.lower().startswith("http"):
+        is_custom_non_http_scheme = ":" in url and not url.lower().startswith("http")
+        if is_custom_non_http_scheme:
             self.url = url
             return
 
@@ -576,80 +715,20 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
     def prepare_body(
         self, data: _t.DataType, files: _t.FilesType, json: _t.JsonType = None
     ) -> None:
-        """Prepares the given HTTP body data."""
-
-        # Check if file, fo, generator, iterator.
-        # If not, run through normal process.
-
-        # Nottin' on you.
+        """Prepares the given HTTP body data using polymorphic payload strategies."""
         body = None
         content_type = None
 
-        if not data and json is not None:
-            # urllib3 requires a bytes-like body. Python 2's json.dumps
-            # provides this natively, but Python 3 gives a Unicode string.
-            content_type = "application/json"
+        for strategy in BODY_PAYLOAD_STRATEGIES:
+            if strategy.can_handle(data, files, json):
+                body, content_type = strategy.prepare(self, data, files, json)
+                if strategy is not StreamPayloadStrategy:
+                    self.prepare_content_length(body)
+                    if content_type and ("content-type" not in self.headers):
+                        self.headers["Content-Type"] = content_type
+                break
 
-            try:
-                body = complexjson.dumps(json, allow_nan=False)
-            except ValueError as ve:
-                raise InvalidJSONError(ve, request=self)
-
-            if not isinstance(body, bytes):
-                body = body.encode("utf-8")
-
-        # data that proxies attributes to underlying objects needs hasattr
-        is_iterable = isinstance(data, Iterable) or hasattr(data, "__iter__")
-        if is_iterable and not isinstance(data, (str, bytes, list, tuple, Mapping)):
-            try:
-                length = super_len(data)
-            except (TypeError, AttributeError, UnsupportedOperation):
-                length = None
-
-            body = data
-
-            if getattr(body, "tell", None) is not None:
-                # Record the current file position before reading.
-                # This will allow us to rewind a file in the event
-                # of a redirect.
-                try:
-                    self._body_position = body.tell()  # type: ignore[union-attr]  # guarded by getattr check
-                except OSError:
-                    # This differentiates from None, allowing us to catch
-                    # a failed `tell()` later when trying to rewind the body
-                    self._body_position = object()
-
-            if files:
-                raise NotImplementedError(
-                    "Streamed bodies and files are mutually exclusive."
-                )
-
-            if length:
-                self.headers["Content-Length"] = builtin_str(length)
-            else:
-                self.headers["Transfer-Encoding"] = "chunked"
-        else:
-            # After is_stream filtering, remaining data is raw (not streamed)
-            raw_data = cast("_t.RawDataType | None", data)
-
-            # Multi-part file uploads.
-            if files:
-                (body, content_type) = self._encode_files(files, raw_data)
-            else:
-                if raw_data:
-                    body = self._encode_params(raw_data)
-                    if isinstance(data, basestring) or _t.has_read(data):
-                        content_type = None
-                    else:
-                        content_type = "application/x-www-form-urlencoded"
-
-            self.prepare_content_length(body)
-
-            # Add content-type if it wasn't explicitly provided.
-            if content_type and ("content-type" not in self.headers):
-                self.headers["Content-Type"] = content_type
-
-        self.body = body  # type: ignore[assignment]  # body transforms from DataType to BodyType
+        self.body = body  # type: ignore[assignment]
 
     def prepare_content_length(self, body: _t.BodyType) -> None:
         """Prepare Content-Length header based on request method and body"""
@@ -659,13 +738,15 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
                 # If length exists, set it. Otherwise, we fallback
                 # to Transfer-Encoding: chunked.
                 self.headers["Content-Length"] = builtin_str(length)
-        elif (
-            self.method not in ("GET", "HEAD")
-            and self.headers.get("Content-Length") is None
-        ):
-            # Set Content-Length to 0 for methods that can have a body
-            # but don't provide one. (i.e. not GET or HEAD)
-            self.headers["Content-Length"] = "0"
+        else:
+            is_body_allowed_method = self.method not in ("GET", "HEAD")
+            is_length_header_missing = self.headers.get("Content-Length") is None
+            if is_body_allowed_method and is_length_header_missing:
+
+
+                # Set Content-Length to 0 for methods that can have a body
+                # but don't provide one. (i.e. not GET or HEAD)
+                self.headers["Content-Length"] = "0"
 
     def prepare_auth(
         self,
@@ -1012,6 +1093,7 @@ class Response:
         for chunk in self.iter_content(
             chunk_size=chunk_size, decode_unicode=decode_unicode
         ):
+
             if pending is not None:
                 # TODO: remove cast after iter_lines rewrite
                 chunk = cast("str | bytes", pending + chunk)
