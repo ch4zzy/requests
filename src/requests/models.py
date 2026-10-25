@@ -660,13 +660,15 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
                 # If length exists, set it. Otherwise, we fallback
                 # to Transfer-Encoding: chunked.
                 self.headers["Content-Length"] = builtin_str(length)
-        elif (
-            self.method not in ("GET", "HEAD")
-            and self.headers.get("Content-Length") is None
-        ):
-            # Set Content-Length to 0 for methods that can have a body
-            # but don't provide one. (i.e. not GET or HEAD)
-            self.headers["Content-Length"] = "0"
+        else:
+            is_body_allowed_method = self.method not in ("GET", "HEAD")
+            is_length_header_missing = self.headers.get("Content-Length") is None
+            if is_body_allowed_method and is_length_header_missing:
+
+
+                # Set Content-Length to 0 for methods that can have a body
+                # but don't provide one. (i.e. not GET or HEAD)
+                self.headers["Content-Length"] = "0"
 
     def prepare_auth(
         self,
@@ -1013,6 +1015,7 @@ class Response:
         for chunk in self.iter_content(
             chunk_size=chunk_size, decode_unicode=decode_unicode
         ):
+
             if pending is not None:
                 # TODO: remove cast after iter_lines rewrite
                 chunk = cast("str | bytes", pending + chunk)
