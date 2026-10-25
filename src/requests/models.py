@@ -197,58 +197,66 @@ class RequestEncodingMixin:
             raise ValueError("Data must not be a string.")
 
         new_fields: list[RequestField | tuple[str, bytes]] = []
-        fields = to_key_val_list(data or {})
-        files = to_key_val_list(files or {})
+        new_fields.extend(RequestEncodingMixin._process_data_fields(data))
 
-        for field, val in fields:
-            if isinstance(val, basestring) or not hasattr(val, "__iter__"):
-                val = [val]
-            for v in val:
-                if v is not None:
-                    # Don't call str() on bytestrings: in Py3 it all goes wrong.
-                    if not isinstance(v, bytes):
-                        v = str(v)
-
-                    new_fields.append(
-                        (
-                            field.decode("utf-8")
-                            if isinstance(field, bytes)
-                            else field,
-                            v.encode("utf-8") if isinstance(v, str) else v,
-                        )
-                    )
-
-        for k, v in files:
-            # support for explicit filename
-            ft = None
-            fh = None
-            if isinstance(v, (tuple, list)):
-                if len(v) == 2:
-                    fn, fp = v
-                elif len(v) == 3:
-                    fn, fp, ft = v
-                else:
-                    fn, fp, ft, fh = v
-            else:
-                fn = guess_filename(v) or k
-                fp = v
-
-            if isinstance(fp, (str, bytes, bytearray)):
-                fdata = fp
-            elif _t.has_read(fp):
-                fdata = fp.read()
-            elif fp is None:  # defensive check for untyped callers
-                continue
-            else:
-                fdata = fp
-
-            rf = RequestField(name=k, data=fdata, filename=fn, headers=fh)
-            rf.make_multipart(content_type=ft)
-            new_fields.append(rf)
+        for k, v in to_key_val_list(files or {}):
+            file_field = RequestEncodingMixin._process_file_field(k, v)
+            if file_field is not None:
+                new_fields.append(file_field)
 
         body, content_type = encode_multipart_formdata(new_fields)
 
         return body, content_type
+
+
+    @staticmethod
+    def _process_data_fields(data: _t.RawDataType | None) -> list[tuple[str, bytes]]:
+        """Normalize and encode form data fields into UTF-8 tuples."""
+        result: list[tuple[str, bytes]] = []
+        fields: list[tuple[Any, Any]] = to_key_val_list(data or {})  # type: ignore[arg-type]
+        for field, val in fields:
+            vals: list[Any] = [val] if (isinstance(val, basestring) or not hasattr(val, "__iter__")) else list(val)
+            for v in vals:
+                if v is not None:
+                    # Don't call str() on bytestrings: in Py3 it all goes wrong.
+                    v_str = str(v) if not isinstance(v, bytes) else None
+                    v_bytes: bytes = v if isinstance(v, bytes) else v_str.encode("utf-8")  # type: ignore[union-attr]
+                    field_str: str = field.decode("utf-8") if isinstance(field, bytes) else str(field)
+                    result.append((field_str, v_bytes))
+        return result
+
+    @staticmethod
+    def _process_file_field(k: str, v: Any) -> RequestField | None:
+        """Process a single file entry (2/3/4-tuple or stream) and return a configured RequestField."""
+        fn: str | None = None
+        fp: Any = None
+        ft: str | None = None
+        fh: Any = None
+        if isinstance(v, (tuple, list)):
+            v_tuple: tuple[Any, ...] = tuple(v)
+            if len(v_tuple) == 2:
+                fn, fp = v_tuple[0], v_tuple[1]
+            elif len(v_tuple) == 3:
+                fn, fp, ft = v_tuple[0], v_tuple[1], v_tuple[2]
+            else:
+                fn, fp, ft, fh = v_tuple[0], v_tuple[1], v_tuple[2], v_tuple[3]
+        else:
+            fn = guess_filename(v) or k
+            fp = v
+
+        fdata: Any
+        if isinstance(fp, (str, bytes, bytearray)):
+            fdata = fp
+        elif _t.has_read(fp):
+            fdata = fp.read()
+        elif fp is None:  # defensive check for untyped callers
+            return None
+        else:
+            fdata = fp
+
+        rf = RequestField(name=k, data=fdata, filename=fn, headers=fh)  # type: ignore[arg-type]
+        rf.make_multipart(content_type=ft)  # type: ignore[arg-type]
+        return rf
 
 
 class RequestHooksMixin:
