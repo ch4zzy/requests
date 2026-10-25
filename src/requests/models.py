@@ -396,6 +396,123 @@ class Request(RequestHooksMixin):
         return p
 
 
+class BodyPayloadStrategy:
+    """Base strategy for preparing request bodies."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        raise NotImplementedError
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[Any, str | None]:
+        raise NotImplementedError
+
+
+class JsonPayloadStrategy(BodyPayloadStrategy):
+    """Strategy for encoding JSON request bodies."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        return not data and json is not None
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[bytes, str]:
+        content_type = "application/json"
+        try:
+            body = complexjson.dumps(json, allow_nan=False)
+        except ValueError as ve:
+            raise InvalidJSONError(ve, request=request)
+
+        if not isinstance(body, bytes):
+            body = body.encode("utf-8")
+        return body, content_type
+
+
+class StreamPayloadStrategy(BodyPayloadStrategy):
+    """Strategy for streaming request bodies and generators."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        is_iterable = isinstance(data, Iterable) or hasattr(data, "__iter__")
+        return is_iterable and not isinstance(data, (str, bytes, list, tuple, Mapping))
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[Any, None]:
+        if files:
+            raise NotImplementedError("Streamed bodies and files are mutually exclusive.")
+
+        try:
+            length = super_len(data)
+        except (TypeError, AttributeError, UnsupportedOperation):
+            length = None
+
+        body = data
+        if getattr(body, "tell", None) is not None:
+            try:
+                request._body_position = body.tell()  # type: ignore[union-attr]
+            except OSError:
+                request._body_position = object()
+
+        if length:
+            request.headers["Content-Length"] = builtin_str(length)
+        else:
+            request.headers["Transfer-Encoding"] = "chunked"
+
+        return body, None
+
+
+class MultipartPayloadStrategy(BodyPayloadStrategy):
+    """Strategy for multipart/form-data file uploads."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        return bool(files)
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[Any, str]:
+        raw_data = cast("_t.RawDataType | None", data)
+        return request._encode_files(files, raw_data)
+
+
+class DefaultPayloadStrategy(BodyPayloadStrategy):
+    """Strategy for form-encoded and raw byte/string bodies."""
+
+    @classmethod
+    def can_handle(cls, data: _t.DataType, files: _t.FilesType, json: _t.JsonType) -> bool:
+        return True
+
+    @classmethod
+    def prepare(
+        cls, request: PreparedRequest, data: _t.DataType, files: _t.FilesType, json: _t.JsonType
+    ) -> tuple[Any, str | None]:
+        raw_data = cast("_t.RawDataType | None", data)
+        body = None
+        content_type = None
+        if raw_data:
+            body = request._encode_params(raw_data)
+            if isinstance(data, basestring) or _t.has_read(data):
+                content_type = None
+            else:
+                content_type = "application/x-www-form-urlencoded"
+        return body, content_type
+
+
+BODY_PAYLOAD_STRATEGIES: tuple[type[BodyPayloadStrategy], ...] = (
+    JsonPayloadStrategy,
+    StreamPayloadStrategy,
+    MultipartPayloadStrategy,
+    DefaultPayloadStrategy,
+)
+
+
 class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
     """The fully mutable :class:`PreparedRequest <PreparedRequest>` object,
     containing the exact bytes that will be sent to the server.
@@ -598,80 +715,20 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
     def prepare_body(
         self, data: _t.DataType, files: _t.FilesType, json: _t.JsonType = None
     ) -> None:
-        """Prepares the given HTTP body data."""
-
-        # Check if file, fo, generator, iterator.
-        # If not, run through normal process.
-
-        # Nottin' on you.
+        """Prepares the given HTTP body data using polymorphic payload strategies."""
         body = None
         content_type = None
 
-        if not data and json is not None:
-            # urllib3 requires a bytes-like body. Python 2's json.dumps
-            # provides this natively, but Python 3 gives a Unicode string.
-            content_type = "application/json"
+        for strategy in BODY_PAYLOAD_STRATEGIES:
+            if strategy.can_handle(data, files, json):
+                body, content_type = strategy.prepare(self, data, files, json)
+                if strategy is not StreamPayloadStrategy:
+                    self.prepare_content_length(body)
+                    if content_type and ("content-type" not in self.headers):
+                        self.headers["Content-Type"] = content_type
+                break
 
-            try:
-                body = complexjson.dumps(json, allow_nan=False)
-            except ValueError as ve:
-                raise InvalidJSONError(ve, request=self)
-
-            if not isinstance(body, bytes):
-                body = body.encode("utf-8")
-
-        # data that proxies attributes to underlying objects needs hasattr
-        is_iterable = isinstance(data, Iterable) or hasattr(data, "__iter__")
-        if is_iterable and not isinstance(data, (str, bytes, list, tuple, Mapping)):
-            try:
-                length = super_len(data)
-            except (TypeError, AttributeError, UnsupportedOperation):
-                length = None
-
-            body = data
-
-            if getattr(body, "tell", None) is not None:
-                # Record the current file position before reading.
-                # This will allow us to rewind a file in the event
-                # of a redirect.
-                try:
-                    self._body_position = body.tell()  # type: ignore[union-attr]  # guarded by getattr check
-                except OSError:
-                    # This differentiates from None, allowing us to catch
-                    # a failed `tell()` later when trying to rewind the body
-                    self._body_position = object()
-
-            if files:
-                raise NotImplementedError(
-                    "Streamed bodies and files are mutually exclusive."
-                )
-
-            if length:
-                self.headers["Content-Length"] = builtin_str(length)
-            else:
-                self.headers["Transfer-Encoding"] = "chunked"
-        else:
-            # After is_stream filtering, remaining data is raw (not streamed)
-            raw_data = cast("_t.RawDataType | None", data)
-
-            # Multi-part file uploads.
-            if files:
-                (body, content_type) = self._encode_files(files, raw_data)
-            else:
-                if raw_data:
-                    body = self._encode_params(raw_data)
-                    if isinstance(data, basestring) or _t.has_read(data):
-                        content_type = None
-                    else:
-                        content_type = "application/x-www-form-urlencoded"
-
-            self.prepare_content_length(body)
-
-            # Add content-type if it wasn't explicitly provided.
-            if content_type and ("content-type" not in self.headers):
-                self.headers["Content-Type"] = content_type
-
-        self.body = body  # type: ignore[assignment]  # body transforms from DataType to BodyType
+        self.body = body  # type: ignore[assignment]
 
     def prepare_content_length(self, body: _t.BodyType) -> None:
         """Prepare Content-Length header based on request method and body"""
